@@ -1,3 +1,4 @@
+#include "trimble_drive.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/float64.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -8,112 +9,159 @@
 #include <unistd.h>
 #include <cstring>
 
-class NMEA_HDT_Parser : public rclcpp::Node
+namespace trimble_driver
 {
-public:
-    NMEA_HDT_Parser() : Node("nmea_hdt_parser")
-    {
-        // Publisher for heading (degrees)
-        heading_publisher_ = this->create_publisher<std_msgs::msg::Float64>("heading", 10);
+NMEA_Parser::NMEA_Parser(const rclcpp::NodeOptions &options)
+    : Node("gps_publisher", options)
+{
+    RCLCPP_INFO(this->get_logger(), "GPSListener constructor start");
 
-        // UDP Socket setup
-        setup_udp_socket("0.0.0.0", 6019); // Bind to all IP addresses for the port
+    // Publisher for heading (degrees)
+    publisher_hdt = this->create_publisher<std_msgs::msg::Float64>("heading", 10);
+
+    publisher_gga = this->create_publisher<sensor_msgs::msg::NavSatFix>("NavSatFix", 10);
+
+    // UDP Socket setup
+    initialize("0.0.0.0", 6019); 
+}
+
+void NMEA_Parser::initialize (const std::string &ip, int port) 
+{
+    (void)ip;  // Suppress unused parameter warning
+
+    struct sockaddr_in server_addr;
+
+    // Create UDP socket
+    sockfd_ = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd_ < 0)
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("rclcpp"), "Error creating UDP socket");
+        return;
     }
 
-    ~NMEA_HDT_Parser()
+    // Setup server address structure
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY; // Listen on all interfaces
+    server_addr.sin_port = htons(port); // Port number
+
+    // Bind the socket to the IP and port
+    if (bind(sockfd_, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
     {
+        RCLCPP_ERROR(rclcpp::get_logger("rclcpp"), "Error binding UDP socket");
         close(sockfd_);
+        return;
     }
 
-private:
-    void setup_udp_socket(const std::string &ip, int port)
+    RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "Listening for UDP packets on port %d", port);
+
+    char buffer[1024];
+    ssize_t len;
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+
+    while (rclcpp::ok())
     {
-        struct sockaddr_in server_addr;
-
-        // Create UDP socket
-        sockfd_ = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sockfd_ < 0)
+        // Receive data from UDP socket
+        len = recvfrom(sockfd_, buffer, sizeof(buffer) - 1, 0, (struct sockaddr *)&client_addr, &addr_len);
+        if (len < 0)
         {
-            RCLCPP_ERROR(this->get_logger(), "Error creating UDP socket");
-            return;
+            RCLCPP_ERROR(rclcpp::get_logger("rclcpp"), "Error receiving data");
+            continue;
         }
 
-        // Setup server address structure
-        memset(&server_addr, 0, sizeof(server_addr));
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_addr.s_addr = INADDR_ANY; // Listen on all interfaces
-        server_addr.sin_port = htons(port); // Port number
+        buffer[len] = '\0'; // Null-terminate the received data
 
-        // Bind the socket to the IP and port
-        if (bind(sockfd_, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
-        {
-            RCLCPP_ERROR(this->get_logger(), "Error binding UDP socket");
-            close(sockfd_);
-            return;
-        }
+        std::string sentence(buffer);
 
-        RCLCPP_INFO(this->get_logger(), "Listening for UDP packets on port %d", port);
-        receive_udp_data();
+        // Process the NMEA sentence
+        process_sentence(sentence);
+    }
+}
+
+void NMEA_Parser::process_sentence(const std::string &sentence)
+{
+    std::vector sentenceData = NMEA_Parser::splitByDelimiter(sentence.c_str(), ',');
+
+    
+   
+    if (sentenceData.size() > 2 && sentenceData[0] == "$GPHDT"){
+        double heading = std::stod(sentenceData[1]);        
+        
+        // Create a message and publish the heading in degrees
+        auto heading_msg = std::make_shared<std_msgs::msg::Float64>();
+        heading_msg->data = heading;
+        publisher_hdt->publish(*heading_msg);
+        RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "Published Heading: %.2f°", heading);
+    } 
+    
+    if (sentenceData.size() > 4 && sentenceData[0] == "$GPGGA") {        
+
+        auto gps_fix = std::make_shared<sensor_msgs::msg::NavSatFix>();
+
+        gps_fix->latitude = NMEA_Parser::convert2Degrees(std::stod(sentenceData[2]),sentenceData[3]);
+        gps_fix->longitude = NMEA_Parser::convert2Degrees(std::stod(sentenceData[4]),sentenceData[5]);
+
+        publisher_gga->publish(*gps_fix);
+    }  
+}
+
+double NMEA_Parser::convert2Degrees(const double &value, std::string direction){
+    
+    double degrees, minutes, result;
+
+    try{
+        degrees = value / 100;
+        minutes = value - (degrees * 100);    
+    }
+    catch(const std::exception & excpt){
+        RCLCPP_WARN(rclcpp::get_logger("rclcpp"), "Exception in degree conversion due to: %s", excpt.what());
+        throw;
+    }
+    
+    result = degrees + (minutes / 60);
+
+    if(direction == "S" || direction == "W"){
+        return -result;
     }
 
-    void receive_udp_data()
-    {
-        char buffer[1024];
-        ssize_t len;
-        struct sockaddr_in client_addr;
-        socklen_t addr_len = sizeof(client_addr);
+    return result;
+}
 
-        while (rclcpp::ok())
-        {
-            // Receive data from UDP socket
-            len = recvfrom(sockfd_, buffer, sizeof(buffer) - 1, 0, (struct sockaddr *)&client_addr, &addr_len);
-            if (len < 0)
-            {
-                RCLCPP_ERROR(this->get_logger(), "Error receiving data");
-                continue;
+std::vector<std::string> NMEA_Parser::splitByDelimiter(const char* charArray, char delimiter){
+    
+    std::vector<std::string> result;
+    std::string token;
+
+    for(int i = 0; charArray[i] != '\0'; i++){
+        if(charArray[i] == delimiter){
+            if(!token.empty()){
+                result.push_back(token);
+                token.clear();
             }
-
-            buffer[len] = '\0'; // Null-terminate the received data
-
-            std::string sentence(buffer);
-
-            // Process the NMEA sentence
-            process_nmea_sentence(sentence);
+        }else{
+            token += charArray[i];
         }
     }
 
-    void process_nmea_sentence(const std::string &sentence)
-    {
-        // Regular expression to match the HDT sentence
-        std::regex hdt_regex("\\$GPHDT,([\\d.]+),T\\*.*");
-        std::smatch match;
-        std::cout << sentence << std::endl;
-
-        if (std::regex_match(sentence, match, hdt_regex))
-        {
-            // Extract the heading value
-            double heading = std::stod(match[1].str());
-
-            // Create a message and publish the heading in degrees
-            auto heading_msg = std::make_shared<std_msgs::msg::Float64>();
-            heading_msg->data = heading;
-            heading_publisher_->publish(*heading_msg);
-            RCLCPP_INFO(this->get_logger(), "Published Heading: %.2f°", heading);
-        }
-        else
-        {
-            ;//RCLCPP_WARN(this->get_logger(), "No HDT sentence found in the received data.");
-        }
+    if(!token.empty()){
+        result.push_back(token);
     }
-
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr heading_publisher_;
-    int sockfd_;
-};
+    
+    return result;
+}
+} // namespace trimble_driver
 
 int main(int argc, char *argv[])
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<NMEA_HDT_Parser>());
+    
+    // Create rclcpp::NodeOptions instance
+    rclcpp::NodeOptions options;
+
+    // Create shared pointer to NMEA_Parser, passing the options to the constructor
+    rclcpp::spin(std::make_shared<trimble_driver::NMEA_Parser>(options));
+
     rclcpp::shutdown();
     return 0;
 }
